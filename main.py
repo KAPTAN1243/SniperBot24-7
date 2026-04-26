@@ -28,7 +28,7 @@ PROXY_REFRESH_INTERVAL = 60
 MAX_PROXY_FAILS = 1
 TIMEOUT = 2.0
 USE_PROXIES = True
-WEBHOOK_INTERVAL = 1.0
+WEBHOOK_INTERVAL = 0.5  # Her 0.5 saniyede 1 webhook
 
 hits = misses = errors = ratelimits = total_checked = checks_per_second = current_cps = 0
 start_time = None
@@ -134,12 +134,14 @@ def mark_ok(p):
 def proxy_refresher():
     while True:
         time.sleep(PROXY_REFRESH_INTERVAL)
-        new = fetch_all_proxies()
-        with proxy_lock:
-            ex = set(proxies_list)
-            for p in new:
-                if p not in ex: proxies_list.append(p)
-        AIOptimizer.rank_proxies()
+        try:
+            new = fetch_all_proxies()
+            with proxy_lock:
+                ex = set(proxies_list)
+                for p in new:
+                    if p not in ex: proxies_list.append(p)
+            AIOptimizer.rank_proxies()
+        except: pass
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
@@ -183,7 +185,7 @@ def check_username(username, proxy_str):
         AIOptimizer.record_ping(proxy_str, 5.0)
         return 'error'
 
-# ── SADE WEBHOOK: "username is available" formatinda ──────────────────────────
+# ── SADE WEBHOOK: "username is available" ─────────────────────────────────────
 def send_webhook(username):
     payload = {'content': username + ' is available'}
     for _ in range(3):
@@ -195,6 +197,7 @@ def send_webhook(username):
         except: time.sleep(2)
 
 def webhook_dispatcher():
+    """Webhook kuyrugundan surekli atar — durmaz"""
     while True:
         try:
             username = webhook_queue.get(timeout=5)
@@ -205,7 +208,7 @@ def webhook_dispatcher():
         except queue.Empty: continue
         except Exception as e:
             print('Webhook hata: ' + str(e))
-            time.sleep(3)
+            time.sleep(2)
 
 def generate_all_usernames():
     out = set()
@@ -242,6 +245,25 @@ def generate_all_usernames():
         out.add(a + b + a + b)
     return list(out)
 
+# ── SUREKLI FEEDER: q.join() yok, durmuyor ───────────────────────────────────
+def username_feeder(q):
+    """Nick uretip surekli kuyruga atar — hicbir zaman durmaz"""
+    batch = 0
+    while True:
+        try:
+            usernames = generate_all_usernames()
+            random.shuffle(usernames)
+            batch += 1
+            print('Batch #' + str(batch) + ' -> ' + str(len(usernames)) + ' hedef kuyruga eklendi')
+            for u in usernames:
+                # Kuyruk doluysa bekle (memory tasarrufu)
+                while q.qsize() > 80000:
+                    time.sleep(1)
+                q.put(u)
+        except Exception as e:
+            print('Feeder hata: ' + str(e))
+            time.sleep(5)
+
 def worker(q):
     global hits, misses, errors, ratelimits, total_checked, checks_per_second
 
@@ -273,7 +295,7 @@ def worker(q):
         else:
             errors += 1; mark_fail(proxy); q.put(username)
 
-        if total_checked % 25 == 0:
+        if total_checked % 50 == 0:
             AIOptimizer.rank_proxies()
         q.task_done()
 
@@ -282,12 +304,14 @@ def update_stats():
     while True:
         current_cps = checks_per_second; checks_per_second = 0
         elapsed = time.strftime('%H:%M:%S', time.gmtime(time.time() - start_time if start_time else 0))
-        print('[STATS] Hits:' + str(hits) + ' Miss:' + str(misses) + ' Err:' + str(errors) + ' | ' + str(current_cps) + ' c/s | ' + elapsed)
+        print('[STATS] Hits:' + str(hits) + ' Miss:' + str(misses) +
+              ' Err:' + str(errors) + ' | ' + str(current_cps) + ' c/s | Uptime:' + elapsed)
         time.sleep(10)
 
 def main():
     global start_time
-    print('=== DISCORD USERNAME SNIPER v6.0 ===')
+    print('=== DISCORD USERNAME SNIPER v6.0 — SUREKLI MOD ===')
+
     keep_alive()
     print('Keep-alive server started on port 8080')
 
@@ -298,42 +322,30 @@ def main():
 
     global THREADS_COUNT
     THREADS_COUNT = 50 if USE_PROXIES else 3
-    print(str(THREADS_COUNT) + ' thread starting...')
+    print(str(THREADS_COUNT) + ' thread baslatiliyor...')
 
     start_time = time.time()
 
-    threading.Thread(target=update_stats, daemon=True).start()
-    threading.Thread(target=proxy_refresher, daemon=True).start()
+    # Arka plan servisleri
+    threading.Thread(target=update_stats,       daemon=True).start()
+    threading.Thread(target=proxy_refresher,    daemon=True).start()
     threading.Thread(target=webhook_dispatcher, daemon=True).start()
 
-    q = queue.Queue(maxsize=100000)
+    # Is kuyrugu
+    q = queue.Queue(maxsize=200000)
+
+    # Worker'lar
     for _ in range(THREADS_COUNT):
         threading.Thread(target=worker, args=(q,), daemon=True).start()
 
-    loop = 0
-    usernames = []
-    print('Running... Available nicks will be sent to webhook every 1s')
+    # Surekli feeder (q.join() yok — hic durmuyor)
+    threading.Thread(target=username_feeder, args=(q,), daemon=True).start()
 
+    print('Calisıyor... Bosta nick\'ler webhook\'a otomatik atilacak.')
+
+    # Ana thread sadece canli tutar
     while True:
-        try:
-            new = generate_all_usernames()
-            usernames = list(set(usernames + new))
-            random.shuffle(usernames)
-            loop += 1
-            print('Loop #' + str(loop) + ' - ' + str(len(usernames)) + ' targets')
-            for u in usernames:
-                q.put(u)
-            q.join()
-            if loop % 5 == 0:
-                usernames = []
-                print('Cleared - fresh generation...')
-            time.sleep(2)
-        except KeyboardInterrupt:
-            print('Stopped.')
-            break
-        except Exception as e:
-            print('ERROR: ' + str(e) + ' - waiting 10s...')
-            time.sleep(10)
+        time.sleep(60)
 
 if __name__ == '__main__':
     main()
